@@ -1,0 +1,419 @@
+#!/bin/sh
+# owrt-snap: full-overlay snapshot/restore for OpenWrt (busybox ash, no extra packages).
+# Restore rides sysupgrade -f: preinit (80_mount_root) unpacks the tarball before any service starts.
+
+set -u
+PROG=owrt-snap
+# OWRT_SNAP_* overrides exist only for off-router testing.
+UPPER=${OWRT_SNAP_UPPER:-/overlay/upper}
+ROM=${OWRT_SNAP_ROM:-/rom}
+SYSINFO=${OWRT_SNAP_SYSINFO:-/tmp/sysinfo}
+RELEASE=${OWRT_SNAP_RELEASE:-/etc/openwrt_release}
+STORE=${OWRT_SNAP_STORE:-$(uci -q get owrt-snap.main.store 2>/dev/null || echo /etc/owrt-snap/store)}
+KEEP=$(uci -q get owrt-snap.main.keep 2>/dev/null || echo 5)
+WO_SCRIPT=/etc/uci-defaults/00-owrt-snap-whiteouts
+LAST=/etc/owrt-snap/last-restore
+# fstools unpacks the restore tar into the preinit /tmp tmpfs; procd mounts it unsized (half of RAM), like /tmp now.
+BOOT_TMP_KB=${OWRT_SNAP_BOOT_TMP_KB:-$(df -Pk /tmp | awk 'NR==2 {print $2}')}
+WORK=
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; }
+trap cleanup EXIT
+trap 'cleanup; exit 1' INT TERM
+
+usage() {
+	cat <<EOF
+usage: $PROG create [-n name] [-i sysupgrade.bin]
+       $PROG list
+       $PROG verify <name|file>
+       $PROG delete <name>
+       $PROG restore <name|file> [-i sysupgrade.bin] [--force] [--yes] [--no-carry-store]
+       $PROG verify-restore [name|file]
+store: $STORE  keep: $KEEP
+EOF
+	exit 1
+}
+
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+kb() { du -sk "$1" | cut -f1; }
+avail_kb() { df -Pk "$1" | awk 'NR==2 {print $4}'; }
+mget() { sed -n "s/^$1=//p" "${2:-$WORK/manifest}" | head -n 1; }
+board() { cat "$SYSINFO/board_name"; }
+relvar() { sed -n "s/^$1='\(.*\)'\$/\1/p" "$RELEASE"; }
+running_revision() { relvar DISTRIB_REVISION; }
+running_vermagic() { apk info -v 2>/dev/null | sed -n 's/^kernel-[^~]*~\([0-9a-f]*\)-r[0-9]*$/\1/p'; }
+mkwork() { WORK=$(mktemp -d /tmp/owrt-snap.XXXXXX) || die "mktemp failed"; }
+
+valid_name() {
+	case $1 in ''|-*|.*|*[!A-Za-z0-9._-]*) die "invalid name '$1' (use A-Z a-z 0-9 . _ -)";; esac
+}
+
+resolve() {
+	case $1 in */*|*.tar.gz) [ -f "$1" ] && { echo "$1"; return 0; } ;; esac
+	[ -f "$STORE/$1.tar.gz" ] && { echo "$STORE/$1.tar.gz"; return 0; }
+	die "no snapshot '$1'"
+}
+
+part_dev() {
+	for u in /sys/class/block/*/uevent; do
+		grep -qx "PARTNAME=$1" "$u" && { echo "/dev/$(basename "${u%/uevent}")"; return 0; }
+	done
+	return 1
+}
+
+# True if the sysupgrade image's kernel and rootfs equal the running partitions byte for byte.
+image_matches_running() {
+	dir=$(tar tf "$1" 2>/dev/null | grep -m 1 '^sysupgrade-.*/$') || { echo "$PROG: $1 is not a sysupgrade tar image" >&2; return 1; }
+	for m in kernel:kernel root:rootfs; do
+		mem=$dir${m%%:*}
+		dev=$(part_dev "${m#*:}") || { echo "$PROG: no ${m#*:} partition" >&2; return 1; }
+		n=$(tar xOf "$1" "$mem" | wc -c)
+		[ "$n" -gt 0 ] || { echo "$PROG: image has no $mem" >&2; return 1; }
+		a=$(tar xOf "$1" "$mem" | sha256sum | cut -d' ' -f1)
+		b=$(head -c "$n" "$dev" | sha256sum | cut -d' ' -f1)
+		[ "$a" = "$b" ] || { echo "$PROG: image ${m%%:*} differs from $dev" >&2; return 1; }
+	done
+}
+
+# Absolute paths deleted from ROM: overlayfs whiteouts (0/0 char devices), plus lower entries hidden
+# by opaque dirs (busybox has no getfattr, so opaque dirs are found by effect, not by xattr).
+collect_whiteouts() {
+	(
+	cd "$UPPER" || exit 1
+	# shellcheck disable=SC2012 # busybox here has no stat applet
+	find . -type c | while IFS= read -r f; do
+		[ "$(ls -ln "$f" | awk '{print $5 $6}')" = "0,0" ] && echo "${f#.}"
+	done
+	find . \( -path ./tmp -o -path ./dev -o -path ./proc -o -path ./sys -o -path ./overlay -o -path ./rom \) -prune \
+		-o -type d -print | while IFS= read -r d; do
+		[ -d "$ROM${d#.}" ] || continue
+		find "$ROM${d#.}" -mindepth 1 -maxdepth 1 | while IFS= read -r l; do
+			p=${l#"$ROM"}
+			[ -e "$p" ] || [ -L "$p" ] || [ -c ".$p" ] || echo "$p"
+		done
+	done
+	)
+}
+
+write_manifest() { # out name image_sha256
+	{
+	echo "format=1"
+	echo "name=$2"
+	echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	echo "hostname=$(cat /proc/sys/kernel/hostname)"
+	echo "board_name=$(board)"
+	echo "distrib_release=$(relvar DISTRIB_RELEASE)"
+	echo "distrib_revision=$(running_revision)"
+	echo "kernel=$(uname -r)"
+	echo "vermagic=$(running_vermagic)"
+	echo "overlay_sha256=$(sha "$WORK/overlay.tar.gz")"
+	echo "image_sha256=$3"
+	echo "whiteouts=$(grep -c . "$WORK/whiteouts.list")"
+	apk info -v 2>/dev/null | sort | sed 's/^/pkg /'
+	sed 's/^/world /' /etc/apk/world
+	} > "$1"
+}
+
+prune() {
+	[ "$KEEP" -gt 0 ] 2>/dev/null || return 0
+	# shellcheck disable=SC2012 # names are validated, ls -t is the only mtime sort in busybox
+	ls -1t "$STORE"/*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | while IFS= read -r s; do
+		rm -f "$s" "$s.sha256" && echo "pruned $(basename "$s" .tar.gz)"
+	done
+}
+
+cmd_create() {
+	name=$(date +%Y%m%d-%H%M%S) img=''
+	while [ $# -gt 0 ]; do
+		case $1 in
+		-n) name=${2:?-n needs a name}; shift 2;;
+		-i) img=${2:?-i needs an image}; shift 2;;
+		*) usage;;
+		esac
+	done
+	valid_name "$name"
+	snap=$STORE/$name.tar.gz
+	[ -e "$snap" ] && die "$snap exists"
+	[ -d "$UPPER/etc" ] || die "$UPPER is not an overlay upper dir"
+	if [ -n "$img" ]; then
+		[ -f "$img" ] || die "no image $img"
+		image_matches_running "$img" || die "refusing to bundle: $img is not the running firmware"
+	fi
+	mkdir -p "$STORE" || die "cannot create $STORE"
+	est=$(kb "$UPPER"); [ -n "$img" ] && est=$((est + $(kb "$img")))
+	[ "$(avail_kb "$STORE")" -ge $((2 * est)) ] || die "need $((2 * est)) KB free in $STORE"
+
+	# Stage in the store (flash), not /tmp (RAM).
+	WORK=$STORE/.new-$name
+	rm -rf "$WORK"; mkdir "$WORK" || die "cannot create $WORK"
+	collect_whiteouts | sort -u > "$WORK/whiteouts.list"
+	# shortcut: exclude entries are globs, so paths containing * ? [ could over-match; none exist on this router.
+	{ sed 's,^,.,' "$WORK/whiteouts.list"
+	  printf '%s\n' ./tmp ./dev ./proc ./sys ./overlay ./rom "./${STORE#/}" ".$LAST"; } > "$WORK/exclude"
+	(cd "$UPPER" && tar czf "$WORK/overlay.tar.gz" -X "$WORK/exclude" .) || die "overlay tar failed"
+	rm -f "$WORK/exclude"
+	files="manifest SHA256SUMS whiteouts.list overlay.tar.gz" isha=none
+	if [ -n "$img" ]; then
+		cp "$img" "$WORK/image.bin" || die "copy image failed"
+		isha=$(sha "$WORK/image.bin") files="$files image.bin"
+	fi
+	write_manifest "$WORK/manifest" "$name" "$isha"
+	# shellcheck disable=SC2086 # word splitting of the fixed file list is intended
+	(cd "$WORK" && sha256sum ${files#manifest SHA256SUMS } manifest > SHA256SUMS && tar czf "$snap.part" $files) ||
+		{ rm -f "$snap.part"; die "archive failed"; }
+	mv "$snap.part" "$snap" && (cd "$STORE" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+	rm -rf "$WORK"; WORK=
+	echo "created $snap ($(kb "$snap") KB, image: $([ "$isha" = none ] && echo no || echo yes))"
+	prune
+}
+
+cmd_list() {
+	printf '%-22s %-20s %8s %-20s %-3s %s\n' NAME DATE SIZE_KB BUILD IMG SUM
+	for s in "$STORE"/*.tar.gz; do
+		[ -f "$s" ] || continue
+		m=$(mktemp) || die "mktemp failed"
+		tar xzOf "$s" manifest > "$m" 2>/dev/null
+		sum=none
+		[ -f "$s.sha256" ] && { if (cd "$STORE" && sha256sum -c -s "$(basename "$s").sha256"); then sum=OK; else sum=BAD; fi; }
+		img=yes; [ "$(mget image_sha256 "$m")" = none ] && img=no
+		printf '%-22s %-20s %8s %-20s %-3s %s\n' "$(basename "$s" .tar.gz)" "$(mget date "$m")" "$(kb "$s")" \
+			"$(mget distrib_revision "$m")" "$img" "$sum"
+		rm -f "$m"
+	done
+}
+
+unpack() { # snapshot -> $WORK
+	need=$(( 3 * $(kb "$1") + 51200 ))
+	[ "$(avail_kb /tmp)" -ge "$need" ] || die "need $need KB free in /tmp"
+	mkwork
+	cp "$1" "$WORK/snap.tar.gz" || die "copy to /tmp failed"
+	tar xzf "$WORK/snap.tar.gz" -C "$WORK" || die "cannot unpack $1"
+	rm -f "$WORK/snap.tar.gz"
+}
+
+check_unpacked() {
+	for f in manifest SHA256SUMS whiteouts.list overlay.tar.gz; do [ -f "$WORK/$f" ] || die "snapshot lacks $f"; done
+	for f in whiteouts.list overlay.tar.gz manifest; do grep -q "  $f\$" "$WORK/SHA256SUMS" || die "SHA256SUMS lacks $f"; done
+	(cd "$WORK" && sha256sum -c -s SHA256SUMS) || die "checksum mismatch"
+	for k in format name board_name distrib_revision vermagic overlay_sha256 image_sha256 whiteouts; do
+		[ -n "$(mget $k)" ] || die "manifest lacks $k"
+	done
+	[ "$(mget overlay_sha256)" = "$(sha "$WORK/overlay.tar.gz")" ] || die "overlay sha256 differs from manifest"
+	if [ -f "$WORK/image.bin" ]; then
+		[ "$(mget image_sha256)" = "$(sha "$WORK/image.bin")" ] || die "image sha256 differs from manifest"
+	else
+		[ "$(mget image_sha256)" = none ] || die "manifest lists an image but none is bundled"
+	fi
+	[ "$(mget whiteouts)" = "$(grep -c . "$WORK/whiteouts.list")" ] || die "whiteout count differs from manifest"
+	grep -q '^pkg ' "$WORK/manifest" || die "manifest has no package list"
+	tar tzf "$WORK/overlay.tar.gz" > /dev/null || die "overlay archive corrupt"
+}
+
+cmd_verify() {
+	[ $# -eq 1 ] || usage
+	snap=$(resolve "$1") || exit 1
+	if [ -f "$snap.sha256" ]; then
+		(cd "$(dirname "$snap")" && sha256sum -c -s "$(basename "$snap").sha256") || die "outer checksum mismatch"
+	fi
+	unpack "$snap"; check_unpacked
+	echo "$(mget name): OK ($(mget distrib_revision), $(grep -c '^pkg ' "$WORK/manifest") packages, $(mget whiteouts) whiteouts, image $([ -f "$WORK/image.bin" ] && echo yes || echo no))"
+}
+
+cmd_delete() {
+	[ $# -eq 1 ] || usage
+	valid_name "$1"
+	[ -f "$STORE/$1.tar.gz" ] || die "no snapshot '$1' in $STORE"
+	rm -f "$STORE/$1.tar.gz" "$STORE/$1.tar.gz.sha256" && echo "deleted $1"
+}
+
+gen_wo_script() {
+	cat <<'EOF'
+#!/bin/sh
+# owrt-snap restore: delete the paths the snapshot had removed from ROM, log each, then self-delete.
+log=/tmp/owrt-snap-restore.log
+while IFS= read -r p; do
+	case $p in /?*) ;; *) continue;; esac
+	if [ -e "$p" ] || [ -L "$p" ]; then
+		if rm -rf "$p"; then echo "removed $p" >> "$log"; else echo "FAILED $p" >> "$log"; fi
+	else
+		echo "absent $p" >> "$log"
+	fi
+done <<'OWRT_SNAP_WO_END'
+EOF
+	cat "$1"
+	cat <<'EOF'
+OWRT_SNAP_WO_END
+rm -f /etc/uci-defaults/00-owrt-snap-whiteouts
+exit 0
+EOF
+}
+
+# Sets tar_kb; fails with fit_why when restore.tgz won't fit the boot /tmp or the /tmp copy sysupgrade makes now.
+fit_check() {
+	tar_kb=$(( $(gzip -cd "$WORK/restore.tgz" | wc -c) / 1024 ))
+	r_kb=$(kb "$WORK/restore.tgz")
+	if [ $((tar_kb + 51200)) -gt "$BOOT_TMP_KB" ]; then
+		fit_why="restore tar is $tar_kb KB, boot /tmp holds $BOOT_TMP_KB KB less 50 MB margin"; return 1
+	fi
+	# image and restore.tgz are already in /tmp; sysupgrade copies restore.tgz once more; stage is freed first.
+	if [ $(( $(avail_kb /tmp) + stage_kb )) -lt $((r_kb + 51200)) ]; then
+		fit_why="/tmp lacks room for image + restore.tgz ($r_kb KB) + its sysupgrade copy + 50 MB"; return 1
+	fi
+}
+
+cmd_restore() {
+	src='' img='' force=0 yes=0 carry=1
+	while [ $# -gt 0 ]; do
+		case $1 in
+		-i) img=${2:?-i needs an image}; shift 2;;
+		--force) force=1; shift;;
+		--yes) yes=1; shift;;
+		--no-carry-store) carry=0; shift;;
+		-*) usage;;
+		*) [ -z "$src" ] || usage; src=$1; shift;;
+		esac
+	done
+	[ -n "$src" ] || usage
+	[ $yes = 1 ] || [ -t 0 ] || die "stdin is not a terminal; rerun with --yes to restore without the prompt"
+	snap=$(resolve "$src") || exit 1
+	unpack "$snap"; check_unpacked
+
+	[ "$(mget board_name)" = "$(board)" ] || die "board mismatch: snapshot $(mget board_name), router $(board) (not overridable)"
+	same=0
+	[ "$(mget distrib_revision) $(mget vermagic)" = "$(running_revision) $(running_vermagic)" ] && same=1
+	[ $same = 1 ] || echo "$PROG: snapshot build $(mget distrib_revision)/$(mget vermagic) differs from running $(running_revision)/$(running_vermagic)" >&2
+
+	if [ -n "$img" ]; then
+		[ -f "$img" ] || die "no image $img"
+		cp "$img" "$WORK/flash.bin" || die "copy image failed"
+		ok=0
+		[ "$(sha "$WORK/flash.bin")" = "$(mget image_sha256)" ] && ok=1
+		[ $ok = 0 ] && [ $same = 1 ] && image_matches_running "$WORK/flash.bin" && ok=1
+		if [ $ok = 0 ]; then
+			[ $force = 1 ] || die "$img is not verified as the snapshot's firmware build (use --force to override)"
+			echo "$PROG: --force: flashing unverified image $img" >&2
+		fi
+		rm -f "$WORK/image.bin"
+	elif [ -f "$WORK/image.bin" ]; then
+		mv "$WORK/image.bin" "$WORK/flash.bin" # verified at create against the snapshot's running partitions
+	else
+		die "no image bundled: supply -i <sysupgrade.bin for $(mget distrib_release) $(mget distrib_revision)>"
+	fi
+
+	st=$WORK/stage
+	if ! { mkdir "$st" && tar xzf "$WORK/overlay.tar.gz" -C "$st"; }; then die "cannot stage overlay"; fi
+	rm -f "$WORK/overlay.tar.gz"
+	mkdir -p "$st/etc/uci-defaults" "$st$LAST" || die "stage failed"
+	if ! { gen_wo_script "$WORK/whiteouts.list" > "$st$WO_SCRIPT" && chmod 755 "$st$WO_SCRIPT"; }; then die "stage failed"; fi
+	cp "$WORK/manifest" "$WORK/whiteouts.list" "$st$LAST/" || die "stage failed"
+
+	# The store sits in the overlay that sysupgrade wipes; carry it inside restore.tgz when it fits.
+	# shellcheck disable=SC2012 # names are validated by create
+	stored=$(ls "$STORE"/*.tar.gz 2>/dev/null | sed 's,.*/,,; s,\.tar\.gz$,,' | tr '\n' ' ' | sed 's/ $//')
+	[ -n "$stored" ] || carry=0
+	why=''
+	[ $carry = 0 ] && [ -n "$stored" ] && why="--no-carry-store given"
+	stage_kb=$(kb "$st")
+	if [ $carry = 1 ]; then
+		files=''
+		for n in $stored; do files="$files $STORE/$n.tar.gz"; [ -f "$STORE/$n.tar.gz.sha256" ] && files="$files $STORE/$n.tar.gz.sha256"; done
+		# shellcheck disable=SC2086 # one validated name per line
+		printf '%s\n' $stored > "$st$LAST/carried.list"
+		# busybox tar strips the leading / so the store lands at the same path at preinit.
+		# shellcheck disable=SC2086 # validated names, no spaces
+		if ! (cd "$st" && tar czf "$WORK/restore.tgz" . $files 2>/dev/null); then
+			carry=0 why="building restore.tgz with the store failed (/tmp full?)"
+		else
+			fit_check || { carry=0 why=$fit_why; }
+		fi
+		[ $carry = 1 ] || rm -f "$WORK/restore.tgz" "$st$LAST/carried.list"
+	fi
+	if [ $carry = 0 ]; then
+		(cd "$st" && tar czf "$WORK/restore.tgz" .) || die "cannot build restore.tgz"
+		fit_check || die "$fit_why"
+	fi
+	rm -rf "$st"
+
+	sysupgrade -T -f "$WORK/restore.tgz" "$WORK/flash.bin" || { rm -f /tmp/sysupgrade.tgz /tmp/sysupgrade.meta /tmp/sysupgrade.ucert; die "sysupgrade -T failed; nothing flashed"; }
+
+	echo "Snapshot:   $(mget name) (created $(mget date))"
+	echo "Firmware:   $(mget distrib_release) $(mget distrib_revision), vermagic $(mget vermagic)"
+	echo "Image:      sha256 $(sha "$WORK/flash.bin")"
+	echo "Restore:    restore.tgz $(kb "$WORK/restore.tgz") KB, unpacks to $tar_kb KB of $BOOT_TMP_KB KB boot /tmp"
+	if [ $carry = 1 ]; then
+		echo "Store:      carried forward ($(echo "$stored" | wc -w) snapshots: $stored)"
+	elif [ -n "$stored" ]; then
+		echo "Store:      WARNING: NOT carried ($why). These snapshots will be LOST: $stored"
+	else
+		echo "Store:      empty, nothing to carry"
+	fi
+	if [ $yes = 0 ]; then
+		printf 'Flash and restore? [y/N] '
+		read -r answer || answer=''
+		case $answer in
+		y|Y) ;;
+		*) rm -f /tmp/sysupgrade.tgz /tmp/sysupgrade.meta /tmp/sysupgrade.ucert; die "aborted; nothing changed";;
+		esac
+	fi
+
+	echo "Flashing $(mget distrib_revision) and restoring snapshot $(mget name). The router reboots now."
+	echo "After boot run: $PROG verify-restore"
+	trap - EXIT INT TERM # sysupgrade reads files from $WORK
+	exec sysupgrade -f "$WORK/restore.tgz" "$WORK/flash.bin"
+}
+
+cmd_verify_restore() {
+	[ $# -le 1 ] || usage
+	mkwork
+	if [ $# -eq 1 ]; then
+		snap=$(resolve "$1") || exit 1
+		tar xzf "$snap" -C "$WORK" manifest whiteouts.list || die "cannot read $snap"
+		ref=$WORK
+	else
+		ref=$LAST
+		[ -f "$ref/manifest" ] || die "no $ref/manifest; pass the snapshot name or file"
+	fi
+	rc=0
+	while IFS= read -r p; do
+		if [ -e "$p" ] || [ -L "$p" ]; then echo "PRESENT, should be deleted: $p"; rc=1; fi
+	done < "$ref/whiteouts.list"
+	sed -n 's/^pkg //p' "$ref/manifest" | sort > "$WORK/want"
+	apk info -v 2>/dev/null | sort > "$WORK/have"
+	grep -vxFf "$WORK/have" "$WORK/want" | sed 's/^/MISSING package: /' | grep . && rc=1
+	grep -vxFf "$WORK/want" "$WORK/have" | sed 's/^/EXTRA package: /' | grep . && rc=1
+	if [ -e /etc/rc.d/S25packet_steering ] || [ -L /etc/rc.d/S25packet_steering ]; then
+		if grep -qx /etc/rc.d/S25packet_steering "$ref/whiteouts.list"; then
+			echo "PRESENT, should be deleted: /etc/rc.d/S25packet_steering"; rc=1
+		else
+			echo "note: /etc/rc.d/S25packet_steering present (also present in snapshot)"
+		fi
+	else
+		echo "S25packet_steering: absent"
+	fi
+	[ -e "$WO_SCRIPT" ] && { echo "LEFTOVER: $WO_SCRIPT"; rc=1; }
+	if [ -f "$ref/carried.list" ]; then
+		while IFS= read -r n; do
+			[ -f "$STORE/$n.tar.gz" ] || { echo "MISSING carried snapshot: $n"; rc=1; }
+		done < "$ref/carried.list"
+	fi
+	for s in "$STORE"/*.tar.gz; do
+		[ -f "$s" ] || continue
+		"$0" verify "$s" || { echo "BAD stored snapshot: $s"; rc=1; }
+	done
+	[ -f /tmp/owrt-snap-restore.log ] && echo "whiteout log: $(grep -c '^removed' /tmp/owrt-snap-restore.log) removed, $(grep -c '^absent' /tmp/owrt-snap-restore.log) absent, $(grep -c '^FAILED' /tmp/owrt-snap-restore.log) failed"
+	[ $rc = 0 ] && echo "verify-restore: OK ($(grep -c . "$WORK/want") packages match $(mget name "$ref/manifest"))"
+	return $rc
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1; shift
+case $cmd in
+create) cmd_create "$@";;
+list) cmd_list;;
+verify) cmd_verify "$@";;
+delete) cmd_delete "$@";;
+restore) cmd_restore "$@";;
+verify-restore) cmd_verify_restore "$@";;
+*) usage;;
+esac
